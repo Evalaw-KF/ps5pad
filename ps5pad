@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# ps5pad — pair and manage PS5 DualSense controllers over Bluetooth on a Raspberry Pi
+#
+#   sudo ps5pad doctor        check (and auto-fix) the Pi's Bluetooth setup
+#   sudo ps5pad pair          guided pairing, retries automatically
+#   sudo ps5pad status        paired controllers, connection state + battery
+#   sudo ps5pad remove MAC    forget one controller
+#   sudo ps5pad forget-all    forget every PS controller
+#
+# Optional: SCAN_SECS=45 ps5pad pair   (default scan window is 30s)
+
+set -u
+
+SCAN_SECS="${SCAN_SECS:-30}"
+# DualSense, DualSense Edge, DualShock 4. Matched as the whole name so
+# "Xbox Wireless Controller" doesn't count.
+NAME_RE='(DualSense( Edge)? )?Wireless Controller'
+SCAN_PID=""
+FOUND_MAC=""
+FOUND_NAME=""
+
+if [[ -t 1 ]]; then
+  G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; B=$'\e[1m'; N=$'\e[0m'
+else
+  G=""; Y=""; R=""; B=""; N=""
+fi
+ok()   { printf '%s✔%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*"; }
+err()  { printf '%s✘%s %s\n' "$R" "$N" "$*" >&2; }
+info() { printf '    %s\n' "$*"; }
+die()  { err "$*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+ps5pad — PS5 DualSense Bluetooth helper for Raspberry Pi
+
+  sudo ps5pad pair          Pair a controller (start here)
+  sudo ps5pad status        Show paired controllers + battery
+  sudo ps5pad doctor        Check/fix Bluetooth on the Pi
+  sudo ps5pad remove MAC    Forget one controller
+  sudo ps5pad forget-all    Forget all PS controllers
+
+Note: a DualSense remembers one Bluetooth host at a time. If you use it on
+the PS5 again (plug in by USB + press PS), run 'sudo ps5pad pair' again
+to bring it back to the Pi.
+EOF
+}
+
+# Every bluetoothctl call gets stdin from /dev/null so it never swallows
+# input from the surrounding 'while read' loops.
+bt()  { bluetoothctl "$@" </dev/null 2>&1; }
+has() { [[ $(bt info "$1") == *"$2"* ]]; }
+
+# Prints "MAC Name" for every known device that looks like a PS controller
+known_pads() {
+  bt devices \
+    | awk '$1=="Device" { mac=$2; $1=""; $2=""; sub(/^ +/, ""); print mac, $0 }' \
+    | grep -E "^[^ ]+ $NAME_RE\$" || true
+}
+
+battery_of() {
+  local mac=${1,,} d
+  for d in /sys/class/power_supply/ps-controller-battery-*; do
+    [[ -e $d ]] || continue
+    if [[ ${d,,} == *"$mac" ]]; then
+      printf '%s%% (%s)' "$(<"$d/capacity")" "$(<"$d/status")"
+      return 0
+    fi
+  done
+  return 1
+}
+
+stop_scan() {
+  if [[ -n $SCAN_PID ]]; then
+    kill "$SCAN_PID" 2>/dev/null
+    wait "$SCAN_PID" 2>/dev/null
+    SCAN_PID=""
+  fi
+}
+trap stop_scan EXIT
+trap 'echo; stop_scan; exit 130' INT
+
+# ---------------------------------------------------------------- doctor
+doctor() {
+  printf '%sChecking Bluetooth setup%s\n' "$B" "$N"
+
+  if ! command -v bluetoothctl >/dev/null; then
+    err "bluetoothctl missing — install it with: sudo apt install bluez"
+    return 1
+  fi
+  ok "BlueZ $(bluetoothctl --version 2>/dev/null | awk '{print $NF}')"
+
+  local cfg
+  for cfg in /boot/firmware/config.txt /boot/config.txt; do
+    [[ -f $cfg ]] || continue
+    if grep -Eq '^[[:space:]]*dtoverlay=(pi3-)?disable-bt' "$cfg"; then
+      err "Bluetooth is switched off in $cfg (dtoverlay=disable-bt)"
+      info "Put a # in front of that line, reboot, then run this again"
+      return 1
+    fi
+    break
+  done
+
+  if command -v rfkill >/dev/null; then
+    local rf
+    rf=$(rfkill list bluetooth 2>/dev/null)
+    if [[ $rf == *"Hard blocked: yes"* ]]; then
+      err "Bluetooth is hard-blocked (rfkill)"
+      return 1
+    fi
+    if [[ $rf == *"Soft blocked: yes"* ]]; then
+      rfkill unblock bluetooth && ok "Bluetooth was soft-blocked by rfkill — unblocked it"
+      sleep 1
+    fi
+  fi
+
+  if ! systemctl is-active --quiet bluetooth; then
+    warn "bluetooth service wasn't running — starting it"
+    if ! systemctl enable --now bluetooth >/dev/null 2>&1; then
+      err "Couldn't start bluetooth.service — check: journalctl -u bluetooth -b"
+      return 1
+    fi
+    sleep 2
+  fi
+  ok "bluetooth service running"
+
+  if [[ $(bt list) != *Controller* ]]; then
+    err "No Bluetooth adapter found"
+    if [[ -n $(systemctl list-unit-files hciuart.service --no-legend 2>/dev/null) ]]; then
+      info "Try: sudo systemctl restart hciuart bluetooth   (or just reboot)"
+    else
+      info "The Pi's built-in radio needs pi-bluetooth: sudo apt install pi-bluetooth && sudo reboot"
+    fi
+    return 1
+  fi
+  ok "Bluetooth adapter found"
+
+  if [[ $(bt show) != *"Powered: yes"* ]]; then
+    bt power on >/dev/null
+    sleep 1
+  fi
+  if [[ $(bt show) == *"Powered: yes"* ]]; then
+    ok "Adapter powered on"
+  else
+    err "Adapter won't power on — check: journalctl -u bluetooth -b"
+    return 1
+  fi
+
+  if modinfo hid_playstation >/dev/null 2>&1; then
+    ok "DualSense driver present (kernel $(uname -r))"
+  else
+    warn "No hid-playstation driver in kernel $(uname -r) — it may pair but buttons won't map"
+    info "Fix: sudo apt update && sudo apt full-upgrade && sudo reboot"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- pairing
+pairing_instructions() {
+  printf '%sPut the controller into pairing mode:%s\n' "$B" "$N"
+  info "1. Unplug it from any USB cable"
+  info "2. Hold CREATE (small button top-left of the touchpad) + the PS button"
+  info "3. Keep holding until the light bar flashes FAST in double-blinks (~3-5s)"
+  info "   Slow pulsing = it's looking for the PS5, not pairing. Let go and retry."
+}
+
+pair_once() {
+  FOUND_MAC=""; FOUND_NAME=""
+  local t m n inf
+
+  bt pairable on >/dev/null
+  bluetoothctl --timeout "$SCAN_SECS" scan on </dev/null >/dev/null 2>&1 &
+  SCAN_PID=$!
+
+  printf 'Scanning'
+  for ((t = 0; t < SCAN_SECS; t++)); do
+    sleep 1
+    printf '.'
+    while read -r m n; do
+      [[ -n $m ]] || continue
+      inf=$(bt info "$m")
+      [[ $inf == *"Connected: yes"* ]] && continue      # already in use
+      [[ $inf == *"RSSI:"* ]] || continue               # not seen by this scan
+      if [[ $inf == *"Paired: yes"* ]]; then
+        # An old pairing that's broadcasting again = stale keys. Clear it;
+        # the ongoing scan will rediscover it fresh.
+        echo
+        warn "Clearing an old pairing for $m so it can pair fresh"
+        bt remove "$m" >/dev/null
+        printf 'Scanning'
+        continue
+      fi
+      FOUND_MAC=$m; FOUND_NAME=$n
+      break
+    done < <(known_pads)
+    [[ -n $FOUND_MAC ]] && break
+  done
+  echo
+  stop_scan
+
+  if [[ -z $FOUND_MAC ]]; then
+    err "No controller in pairing mode found within ${SCAN_SECS}s"
+    return 1
+  fi
+  ok "Found $FOUND_NAME ($FOUND_MAC)"
+
+  # Trust before pairing: the controller connects to the Pi the moment
+  # pairing finishes, and one-shot bluetoothctl registers no agent to
+  # approve that, so BlueZ refuses it unless the device is already trusted.
+  bt trust "$FOUND_MAC" >/dev/null
+
+  printf 'Pairing... '
+  local out
+  out=$(timeout 45 bluetoothctl pair "$FOUND_MAC" </dev/null 2>&1)
+  if ! has "$FOUND_MAC" "Paired: yes"; then
+    echo
+    err "Pairing failed"
+    grep -E 'Failed|Error' <<<"$out" | tail -n 3 | sed 's/^/    /'
+    bt remove "$FOUND_MAC" >/dev/null
+    return 1
+  fi
+  echo "done"
+
+  bt trust "$FOUND_MAC" >/dev/null && ok "Trusted — from now on just press PS to reconnect"
+
+  local i
+  for ((i = 0; i < 12; i++)); do
+    has "$FOUND_MAC" "Connected: yes" && break
+    if (( i == 3 || i == 7 )); then
+      timeout 20 bluetoothctl connect "$FOUND_MAC" </dev/null >/dev/null 2>&1
+    fi
+    sleep 1
+  done
+
+  if ! has "$FOUND_MAC" "Connected: yes"; then
+    err "Paired, but it didn't connect"
+    return 1
+  fi
+  ok "Connected — the light bar should go solid"
+
+  sleep 2
+  if grep -qixF "U: Uniq=$FOUND_MAC" /proc/bus/input/devices 2>/dev/null; then
+    ok "Linux has created the input device"
+  else
+    warn "Connected, but no input device showed up — run: sudo ps5pad doctor"
+  fi
+
+  local bat
+  bat=$(battery_of "$FOUND_MAC") && ok "Battery: $bat"
+  return 0
+}
+
+cmd_pair() {
+  doctor || die "Fix the issue above, then run: sudo ps5pad pair"
+  local attempt
+  for attempt in 1 2 3; do
+    echo
+    pairing_instructions
+    read -rp "Press Enter once it's flashing (Ctrl+C to quit)... " _
+    if pair_once; then
+      echo
+      ok "${B}All set.${N}"
+      return 0
+    fi
+    (( attempt < 3 )) && warn "Attempt $attempt didn't work — let's go again."
+  done
+  echo
+  err "Couldn't pair after 3 attempts. Recent Bluetooth log:"
+  journalctl -u bluetooth -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+  exit 1
+}
+
+# ---------------------------------------------------------------- manage
+cmd_status() {
+  local any=0 m n inf state bat
+  while read -r m n; do
+    [[ -n $m ]] || continue
+    inf=$(bt info "$m")
+    [[ $inf == *"Paired: yes"* ]] || continue
+    any=1
+    if [[ $inf == *"Connected: yes"* ]]; then state="${G}connected${N}"; else state="asleep/off"; fi
+    bat=$(battery_of "$m") || bat="—"
+    printf '%s  %s\n    %s · battery %s\n' "$m" "$n" "$state" "$bat"
+  done < <(known_pads)
+  (( any )) || info "No paired PS controllers. Run: sudo ps5pad pair"
+}
+
+cmd_remove() {
+  local mac=${1:-}
+  [[ $mac =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] \
+    || die "Usage: sudo ps5pad remove AA:BB:CC:DD:EE:FF  (MACs are in 'ps5pad status')"
+  if [[ $(bt remove "${mac^^}") == *"removed"* ]]; then
+    ok "Removed $mac"
+  else
+    err "Couldn't remove $mac (is it paired?)"
+  fi
+}
+
+cmd_forget_all() {
+  local m n count=0
+  while read -r m n; do
+    [[ -n $m ]] || continue
+    bt remove "$m" >/dev/null && ok "Removed $n ($m)" && count=$((count + 1))
+  done < <(known_pads)
+  (( count )) || info "Nothing to remove."
+}
+
+# ---------------------------------------------------------------- main
+main() {
+  local cmd=${1:-help}
+  shift || true
+  case $cmd in
+    help|-h|--help) usage; return 0 ;;
+  esac
+  if [[ $EUID -ne 0 ]]; then
+    exec sudo -- env SCAN_SECS="$SCAN_SECS" "$0" "$cmd" "$@"
+  fi
+  case $cmd in
+    pair)       cmd_pair ;;
+    status)     cmd_status ;;
+    doctor)     doctor ;;
+    remove)     cmd_remove "${1:-}" ;;
+    forget-all) cmd_forget_all ;;
+    *)          err "Unknown command: $cmd"; usage; return 1 ;;
+  esac
+}
+
+main "$@"
